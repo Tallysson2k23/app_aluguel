@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function self(uid) { return signed() && request.auth.uid == uid; }
+    function verified() { return signed() && request.auth.token.email_verified == true; }
+    function listing(id) { return /databases/$(database)/documents/listings/$(id); }
+    function contact(id) { return /databases/$(database)/documents/contacts/$(id); }
+    function limited() { return request.query.limit != null && request.query.limit <= 50; }
+    function publicListing(d) {
+      return d.publication == 'published' && d.visibility in ['normal', 'occupied'];
+    }
+    function text(value, max) { return value is string && value.size() <= max; }
+    function count(value, max) { return value is int && value >= 0 && value <= max; }
+    function amount(value) { return value is number && value >= 0 && value <= 100000000; }
+    function optionalAmount(value) { return value == null || amount(value); }
+    function listingFields(d) {
+      let fields = ['city','ownerId','publication','visibility','purpose','kind','availability',
+        'title','description','neighborhood','latCell','lngCell','price','condo','tax','fees',
+        'size','beds','baths','parking','pets','furnished','garage','accessible','availableOn',
+        'showOccupied','contactEnabled','createdAt','updatedAt'];
+      return d.keys().hasOnly(fields) && d.keys().hasAll(fields);
+    }
+    function listingValues(d) {
+      return text(d.city, 90) && d.city.matches('^[a-z0-9-]+$')
+        && d.publication in ['draft', 'published', 'paused', 'archived']
+        && d.purpose in ['rent', 'sale'] && d.kind in ['house', 'apartment']
+        && text(d.title, 90) && text(d.description, 3000) && text(d.neighborhood, 70)
+        && d.latCell is int && d.latCell >= -45000 && d.latCell <= 45000
+        && d.lngCell is int && d.lngCell >= -90000 && d.lngCell <= 90000
+        && amount(d.price) && optionalAmount(d.condo) && optionalAmount(d.tax) && optionalAmount(d.fees)
+        && d.size is number && d.size >= 0 && d.size <= 100000
+        && count(d.beds, 100) && count(d.baths, 100) && count(d.parking, 100)
+        && d.pets is bool && d.furnished is bool && d.garage is bool && d.accessible is bool
+        && d.showOccupied is bool && d.contactEnabled is bool
+        && d.createdAt is timestamp && d.updatedAt == request.time;
+    }
+    function listingStatus(d) {
+      return (d.purpose == 'rent' && d.availability in ['available','soon','occupied']
+          || d.purpose == 'sale' && d.availability in ['available','closed'])
+        && (d.availableOn == null || d.availability == 'soon'
+          && d.availableOn is string && d.availableOn.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'))
+        && (!d.showOccupied || d.availability == 'occupied')
+        && d.visibility == (d.availability == 'closed' ? 'hidden' : d.availability == 'occupied'
+          ? (d.showOccupied ? 'occupied' : 'hidden') : 'normal')
+        && (!d.contactEnabled || d.visibility == 'normal');
+    }
+    function validListing(d, id) {
+      return listingFields(d) && listingValues(d) && listingStatus(d)
+        && (d.publication != 'published' || verified() && d.title.matches('.*[^ ].*')
+          && d.title.size() >= 5 && d.description.size() >= 15 && d.neighborhood.matches('.*[^ ].*')
+          && d.neighborhood.size() >= 2 && d.price > 0 && d.size > 0)
+        && (!d.contactEnabled || existsAfter(contact(id))
+          && getAfter(contact(id)).data.ownerId == d.ownerId);
+    }
+
+    match /listings/{id} {
+      allow get: if publicListing(resource.data) || self(resource.data.ownerId);
+      allow list: if limited() && (publicListing(resource.data) || self(resource.data.ownerId));
+      allow create: if self(request.resource.data.ownerId) && validListing(request.resource.data, id)
+        && request.resource.data.createdAt == request.time;
+      allow update: if self(resource.data.ownerId) && validListing(request.resource.data, id)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.city == resource.data.city;
+    }
+
+    match /contacts/{id} {
+      allow get: if self(get(listing(id)).data.ownerId) || verified()
+        && get(listing(id)).data.publication == 'published'
+        && get(listing(id)).data.visibility == 'normal'
+        && get(listing(id)).data.contactEnabled == true;
+      allow create, update: if self(request.resource.data.ownerId)
+        && request.resource.data.keys().hasOnly(['ownerId','phone','updatedAt'])
+        && request.resource.data.phone is string
+        && request.resource.data.phone.matches('^55[1-9][0-9](9[0-9]{8}|[2-5][0-9]{7})$')
+        && request.resource.data.updatedAt == request.time
+        && getAfter(listing(id)).data.ownerId == request.auth.uid;
+      allow delete: if self(resource.data.ownerId) && !getAfter(listing(id)).data.contactEnabled;
+    }
+
+    match /profiles/{uid} {
+      allow get: if self(uid);
+      allow create, update: if self(uid) && request.resource.data.keys().hasOnly(['name', 'updatedAt'])
+        && text(request.resource.data.name, 80) && request.resource.data.name.size() >= 2
+        && request.resource.data.updatedAt == request.time;
+      match /favorites/{id} {
+        allow get: if self(uid);
+        allow list: if self(uid) && limited();
+        allow create: if self(uid) && request.resource.data.keys().hasOnly(['createdAt'])
+          && request.resource.data.createdAt == request.time && publicListing(get(listing(id)).data);
+        allow delete: if self(uid);
+      }
+    }
+
+    match /reports/{id}/submissions/{uid} {
+      allow create: if self(uid) && publicListing(get(listing(id)).data)
+        && request.resource.data.keys().hasOnly(['reason','createdAt'])
+        && request.resource.data.reason in ['Fraude ou golpe', 'Informações incorretas', 'Conteúdo inadequado', 'Outro']
+        && request.resource.data.createdAt == request.time;
+    }
+  }
+}
+
